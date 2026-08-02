@@ -7,11 +7,26 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora
+            container: fedora:latest
+          - name: ubuntu
+            container: ''
     steps:
+      - name: Install dependencies (fedora)
+        if: matrix.name == 'fedora'
+        run: dnf install -y git tar ShellCheck desktop-file-utils diffutils file findutils
+
       - uses: actions/checkout@v4
 
-      - name: Install shellcheck
+      - name: Install dependencies (ubuntu)
+        if: matrix.name == 'ubuntu'
         run: sudo apt-get update && sudo apt-get install -y shellcheck desktop-file-utils
 
       - name: Run tests
