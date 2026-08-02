@@ -299,7 +299,10 @@ write_desktop() {
 	} > "$entry"
 
 	chmod +x "$entry"
-	command -v desktop-file-validate >/dev/null && desktop-file-validate "$entry" || true
+	# Validate when the tool is there, but never fail the install over it.
+	if command -v desktop-file-validate >/dev/null; then
+		desktop-file-validate "$entry" || true
+	fi
 }
 
 # Parse, resolve, then run whichever of the three jobs was asked for.
