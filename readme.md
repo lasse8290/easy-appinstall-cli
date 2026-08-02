@@ -9,8 +9,8 @@ One bash script, no dependencies.
 ## bootstrap
 
 ```sh
-git clone git@github.com:lasse8290/fk-appinstall.git
-cd fk-appinstall
+git clone git@github.com:lasse8290/easy-appinstall-cli.git
+cd easy-appinstall-cli
 chmod +x appinstall.sh
 ./appinstall.sh -b
 ```
