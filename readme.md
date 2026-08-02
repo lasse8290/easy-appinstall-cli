@@ -101,4 +101,3 @@ Runs against a throwaway `$HOME`, so the real one is never touched.
 
 Currently only Fedora KDE is tested/supported.
 
-test
