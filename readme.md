@@ -1,10 +1,13 @@
 # Fedora-KDE application installer
 
-A very simple application installer for Fedora KDE. Point it at an AppImage or any other
-executable. It symlinks the file onto your PATH and writes a `.desktop` entry, so the
+A very simple application installer for Fedora KDE. Point it at an AppImage, another
+executable, or an application archive. It symlinks the executable onto your PATH and writes a
+`.desktop` entry, so the
 program runs from the terminal by name and shows up in the KDE launcher.
 
-One bash script, no dependencies.
+One Bash script using standard Linux utilities. ZIP archives need Info-ZIP `unzip`.
+Tar archives need GNU `tar` and the matching decompressor (`gzip`, `bzip2`, or `xz`).
+Python is used only to generate test data; the installer does not use it.
 
 ## bootstrap
 
@@ -44,18 +47,60 @@ appinstall -f -n Obsidian ~/Downloads/Obsidian.AppImage
 sudo appinstall -s -n Obsidian /opt/Obsidian.AppImage
 ```
 
+## installing archives
+
+```sh
+appinstall ~/Downloads/tool.tar.gz
+appinstall --install-dir ~/Apps --executable tool/bin/tool ~/Downloads/tool.zip
+```
+
+Supports `.zip`, `.tar`, `.tar.gz` / `.tgz`, `.tar.bz2` / `.tbz2`, and `.tar.xz` / `.txz`.
+The first example extracts into `~/Programs/tool/`, preserving the archive's directory
+structure. The source archive stays in place. Ordinary executable inputs are still linked
+in place.
+
+If the archive contains exactly one executable file, that file is selected automatically.
+Otherwise, pass `--executable` with its path relative to the archive root. This also works
+when the file lacks execute permission. The command name comes from the selected executable;
+use `-c` to change it. All the existing launcher and icon options still apply.
+
+Set a default archive destination in `~/.config/app-install/configfile`:
+
+```ini
+install_dir=~/Programs
+```
+
+`--install-dir DIR` (or `-p DIR`) overrides the config value. If `XDG_CONFIG_HOME` is set,
+the config is read from `$XDG_CONFIG_HOME/app-install/configfile`. Without either setting,
+the default is `~/Programs`, or `/usr/local/Programs` with `-s`.
+
+Values can contain spaces and may have surrounding single or double quotes. A leading `~/`
+expands to your home directory. Relative destinations are resolved from the current directory.
+Blank lines and full-line `#` comments are allowed. Shell variables and commands are not expanded.
+
+An existing archive installation requires `-f` to replace. The replacement removes the old
+directory and its contents, so keep personal files outside the application directory.
+Extraction and executable selection finish before the old directory is replaced.
+
+Archive paths cannot be absolute or contain `..` components. Bash checks archive names and
+file types before extraction. Tar links must also use relative paths without `..` components.
+ZIP links and special files are rejected. Tar names with control characters or backslashes
+are rejected because they cannot be checked directly against the archive listing.
+
 ## options
 Designed to mirror the KDE Desktop Entry Specification.
 `appinstall --help`:
 
 ```
-usage: appinstall [opts] <executable>
+usage: appinstall [opts] <executable-or-archive>
        appinstall -u <name>
        appinstall -b
 
   -n NAME    name shown in the launcher (default: the command name, capitalised)
   -c NAME    name typed in the terminal (default: the file's own name, minus .AppImage)
   -e         also drop any other extension, e.g. thing.sh -> thing
+  -p DIR, --install-dir DIR     extract archives under DIR (default ~/Programs)
+  --executable PATH            executable path inside the archive
   -i ICON    icon file, or the name of one already in the theme
   -d TEXT    comment / tooltip
   -C LIST    categories, e.g. Development;IDE; (default Utility)
@@ -77,13 +122,17 @@ appinstall -u obsidian
 
 Takes the command name, any casing, with or without a `.desktop` suffix. Removes the
 desktop entry, the symlink and the icon. A real file in `~/.local/bin` is never touched.
+Application files, including extracted archive directories, are kept. Delete the relevant
+directory under `~/Programs` (or your chosen destination) separately if it is no longer needed.
 
 ## structure
 
 ```
 appinstall.sh      the whole program
 tests/run.sh       the test cases
-tests/harness.sh   test frameowrk, sandbox and assertions the tests use
+tests/harness.sh   test framework, sandbox and assertions the tests use
+tests/make_archive.py  archive test-data generator
+tests/make_pngs.py     PNG test-data generator
 ```
 
 `run.sh` sources `harness.sh`, then runs each case in a throwaway temp `$HOME`.

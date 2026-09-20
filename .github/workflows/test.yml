@@ -26,13 +26,17 @@ jobs:
     steps:
       - name: Install dependencies (fedora)
         if: matrix.name == 'fedora'
-        run: dnf install -y git tar ShellCheck desktop-file-utils diffutils file findutils
+        run: >-
+          dnf install -y git tar ShellCheck desktop-file-utils diffutils file findutils
+          unzip gzip bzip2 xz python3
 
       - uses: actions/checkout@v4
 
       - name: Install dependencies (ubuntu)
         if: matrix.name == 'ubuntu'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck desktop-file-utils
+        run: >-
+          sudo apt-get update && sudo apt-get install -y shellcheck desktop-file-utils
+          unzip gzip bzip2 xz-utils python3
 
       - name: Run tests
         run: tests/run.sh

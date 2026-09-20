@@ -16,13 +16,15 @@ say() { echo "$prog: $*"; }
 # The help text, also shown when there is nothing to install.
 usage() {
 	cat >&2 <<-EOF
-	usage: $prog [opts] <executable>
+	usage: $prog [opts] <executable-or-archive>
 	       $prog -u <name>
 	       $prog -b
 
 	  -n NAME    name shown in the launcher (default: the command name, capitalised)
 	  -c NAME    name typed in the terminal (default: the file's own name, minus .AppImage)
 	  -e         also drop any other extension, e.g. thing.sh -> thing
+	  -p DIR, --install-dir DIR     extract archives under DIR (default ~/Programs)
+	  --executable PATH            executable path inside the archive
 	  -i ICON    icon file, or the name of one already in the theme
 	  -d TEXT    comment / tooltip
 	  -C LIST    categories, e.g. Development;IDE; (default Utility)
@@ -35,9 +37,16 @@ usage() {
 	  -b         install this script into ~/.local/bin
 	  --no-symlink / --no-desktop    do only one half
 
+	archives: .zip (unzip), .tar, .tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz (GNU tar)
+	config: \${XDG_CONFIG_HOME:-~/.config}/app-install/configfile, install_dir=~/Programs
+	--install-dir overrides config; -s defaults to /usr/local/Programs.
+
 	examples:
 	  # the usual case, a symlink plus a launcher entry
 	  $prog ~/Downloads/Obsidian.AppImage
+
+	  # extract a bundle and select its executable
+	  $prog --executable tool/bin/tool -p ~/Programs ~/Downloads/tool.tar.gz
 
 	  # give it a proper name, an icon and a tooltip
 	  $prog -n Obsidian -i ~/pics/obsidian.png -d Notes ~/Downloads/Obsidian.AppImage
@@ -76,6 +85,8 @@ name='' cmdname='' icon='' comment='' wmclass='' argspec='' target=''
 categories=Utility
 terminal=false
 sys=0 symlink=1 desktop=1 force=0 remove=0 boot=0 stripext=0
+install_dir='' archive_executable='' archive_stage=''
+archive_destination=''
 
 # Install locations, set by resolve_dirs.
 bindir='' appdir='' icondir=''
@@ -96,6 +107,12 @@ parse_args() {
 		-a) argspec=${2-}; shift 2 ;;
 		-t) terminal=true; shift ;;
 		-e|--strip-ext) stripext=1; shift ;;
+		-p|--install-dir)
+			[[ -n ${2-} && $2 != -* ]] || die "$1 needs a directory"
+			install_dir=$2; shift 2 ;;
+		--executable)
+			[[ -n ${2-} && $2 != -* ]] || die "$1 needs a relative path"
+			archive_executable=$2; shift 2 ;;
 		-s) sys=1; shift ;;
 		-f) force=1; shift ;;
 		-u|--uninstall) remove=1; shift ;;
@@ -103,7 +120,10 @@ parse_args() {
 		--no-symlink) symlink=0; shift ;;
 		--no-desktop) desktop=0; shift ;;
 		-h|--help) usage; exit 0 ;;
-		--) shift; break ;;
+		--)
+			shift
+			(($# == 1)) || die "expected one target after --"
+			target=$1; shift ;;
 		-*) die "no such option: $1" ;;
 		*) target=$1; shift ;;
 		esac
@@ -195,11 +215,199 @@ uninstall() {
 	reload
 }
 
+# Read values as text. Do not execute commands from the config file.
+resolve_install_dir() {
+	local config=${XDG_CONFIG_HOME:-$HOME/.config}/app-install/configfile line value
+	if [[ -z $install_dir && -e $config ]]; then
+		[[ -f $config && -r $config ]] || die "cannot read config: $config"
+		while IFS= read -r line || [[ -n $line ]]; do
+			line=${line#"${line%%[![:space:]]*}"}
+			line=${line%"${line##*[![:space:]]}"}
+			[[ -z $line || $line == \#* ]] && continue
+			[[ $line =~ ^install_dir[[:space:]]*=(.*)$ ]] || die "invalid config: $line"
+			value=${BASH_REMATCH[1]}
+			value=${value#"${value%%[![:space:]]*}"}
+			value=${value%"${value##*[![:space:]]}"}
+			case $value in
+			\"*\") value=${value:1:${#value}-2} ;;
+			\'*\') value=${value:1:${#value}-2} ;;
+			esac
+			[[ -n $value ]] || die "install_dir is empty in $config"
+			install_dir=$value
+		done < "$config"
+	fi
+	if [[ -z $install_dir ]]; then
+		if ((sys)); then install_dir=/usr/local/Programs; else install_dir=$HOME/Programs; fi
+	fi
+	# Match a literal tilde from the config file.
+	# shellcheck disable=SC2088
+	case $install_dir in
+	'~') install_dir=$HOME ;;
+	'~/'*) install_dir=$HOME/${install_dir:2} ;;
+	esac
+	install_dir=$(realpath -m -- "$install_dir")
+}
+
+# Remove incomplete files when extraction fails or the process stops.
+cleanup_archive() {
+	[[ -n $archive_stage ]] || return 0
+	if [[ -d $archive_stage/previous && ! -e $archive_destination ]]; then
+		if ! mv -T -- "$archive_stage/previous" "$archive_destination"; then
+			say "cannot restore installation; previous files kept in $archive_stage/previous"
+			return 1
+		fi
+	fi
+	rm -rf -- "$archive_stage"
+}
+
+# Reject paths that can leave the extraction directory.
+check_archive_path() {
+	local path=$1
+	[[ -n $path && $path != /* && /$path/ != */../* ]] ||
+		die "unsafe archive path: $path"
+	[[ $path != *[[:cntrl:]]* && $path != *\\* ]] ||
+		die "unsupported characters in archive path: $path"
+}
+
+# Check names and file types before unzip can create any links.
+extract_zip() {
+	local entry
+	command -v unzip >/dev/null || die "ZIP extraction needs unzip"
+	unzip -Z -1 "$target" > "$archive_stage/names" || die "cannot list ZIP archive"
+	while IFS= read -r entry; do
+		check_archive_path "$entry"
+	done < "$archive_stage/names"
+	unzip -Z -l "$target" > "$archive_stage/types" || die "cannot list ZIP file types"
+	while IFS= read -r entry; do
+		case $entry in
+		Archive:*|'Zip file size:'*|[0-9]*' file'*|[-d]*) ;;
+		*) die "unsupported ZIP entry: $entry" ;;
+		esac
+	done < "$archive_stage/types"
+	unzip -q -o "$target" -d "$archive_stage/files" </dev/null || die "cannot extract ZIP archive"
+}
+
+# Tar quotes unusual names. Reject these names instead of decoding them.
+extract_tar() {
+	local mode entry link
+	command -v tar >/dev/null || die "tar extraction needs GNU tar"
+	tar --list --verbose --numeric-owner --quoting-style=escape --force-local \
+		--file="$target" > "$archive_stage/types" || die "cannot list tar archive"
+	while read -r mode _ _ _ _ entry; do
+		case $mode in
+		[-d]*) check_archive_path "$entry" ;;
+		l*)
+			[[ $entry == *' -> '* ]] || die "invalid tar link: $entry"
+			link=${entry#* -> }
+			[[ $link != *' -> '* ]] || die "ambiguous tar link: $entry"
+			check_archive_path "${entry%% -> *}"
+			check_archive_path "$link" ;;
+		h*)
+			[[ $entry == *' link to '* ]] || die "invalid tar hard link: $entry"
+			link=${entry#* link to }
+			[[ $link != *' link to '* ]] || die "ambiguous tar hard link: $entry"
+			check_archive_path "${entry%% link to *}"
+			check_archive_path "$link" ;;
+		*) die "unsupported tar entry: $entry" ;;
+		esac
+	done < "$archive_stage/types"
+	tar --extract --file="$target" --directory="$archive_stage/files" --force-local \
+		--keep-old-files --no-same-owner --no-same-permissions || die "cannot extract tar archive"
+}
+
+# Select an executable without following directory links during the search.
+select_archive_executable() {
+	local root=$archive_stage/files selected resolved
+	local -a candidates=()
+	if [[ -n $archive_executable ]]; then
+		check_archive_path "$archive_executable"
+		selected=$root/$archive_executable
+	else
+		find "$root" -type f -perm /111 -print0 > "$archive_stage/executables" ||
+			die "cannot find executables"
+		mapfile -d '' -t candidates < "$archive_stage/executables"
+		((${#candidates[@]} == 1)) ||
+			die "use --executable PATH; found ${#candidates[@]} executables"
+		selected=${candidates[0]}
+	fi
+	resolved=$(realpath -e -- "$selected") || die "no such executable: $selected"
+	[[ $resolved == "$root/"* && -f $resolved ]] ||
+		die "--executable must name a file inside the archive"
+	chmod u+x -- "$resolved" || die "cannot make executable: $selected"
+	printf '%s\n' "${selected#"$root/"}"
+}
+
+# Keep tool options and listing formats consistent during validation and extraction.
+extract_archive() {
+	export LC_ALL=C
+	unset TAR_OPTIONS UNZIP UNZIPOPT ZIPINFO ZIPINFOOPT
+	case ${target,,} in
+	*.zip) extract_zip ;;
+	*) extract_tar ;;
+	esac
+	find "$archive_stage/files" -type f -exec chmod a-s -- {} + ||
+		die "cannot clear special permissions"
+	select_archive_executable
+}
+
+# Check launcher conflicts before moving the extracted files into place.
+check_install_conflicts() {
+	if ((desktop)) && [[ -e $appdir/$id.desktop || -L $appdir/$id.desktop ]]; then
+		((force)) || die "$appdir/$id.desktop exists, -f to replace"
+	fi
+	if ((symlink)) && [[ -e $bindir/$cmdname || -L $bindir/$cmdname ]]; then
+		[[ -L $bindir/$cmdname && $(readlink -f -- "$bindir/$cmdname") == "$target" ]] && return
+		((force)) || die "$bindir/$cmdname exists, -f to replace"
+	fi
+}
+
+# Extract into a separate directory before replacing an existing installation.
+install_archive() {
+	local base=${target##*/} suffix relative destination
+	for suffix in .tar.gz .tar.bz2 .tar.xz .tar .tgz .tbz2 .txz .zip; do
+		if [[ ${base,,} == *"$suffix" ]]; then
+			base=${base:0:${#base}-${#suffix}}
+			break
+		fi
+	done
+	[[ -n $base && $base != . && $base != .. ]] || die "invalid archive name"
+	resolve_install_dir
+	destination=$install_dir/$base
+	archive_destination=$destination
+	[[ ! -L $destination ]] || die "archive destination is a symlink: $destination"
+	if [[ -e $destination ]]; then
+		[[ -d $destination ]] || die "archive destination is not a directory: $destination"
+		((force)) || die "$destination exists, -f to replace"
+	fi
+	mkdir -p -- "$install_dir"
+	archive_stage=$(mktemp -d "$install_dir/.app-install-XXXXXXXX")
+	trap cleanup_archive EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	mkdir -- "$archive_stage/files"
+	relative=$(extract_archive) || die "cannot install archive: $target"
+	target=$destination/$relative
+	derive_names
+	check_install_conflicts
+	if [[ -d $destination ]]; then
+		mv -T -- "$destination" "$archive_stage/previous"
+	fi
+	if ! mv -T -- "$archive_stage/files" "$destination"; then
+		die "cannot install into $destination"
+	fi
+	say "extracted $destination"
+}
+
 # Check the target is a real file, resolve it, and make sure it can run.
 resolve_target() {
 	[[ -e $target ]] || die "no such file: $target"
 	target=$(readlink -f -- "$target")
 	[[ -f $target ]] || die "not a regular file: $target"
+	case ${target,,} in
+	*.zip|*.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz)
+		install_archive; return ;;
+	esac
+	[[ -z $archive_executable && -z $install_dir ]] || die "archive options need an archive"
 	[[ -x $target ]] || { chmod +x "$target"; say "chmod +x $target"; }
 }
 
@@ -215,6 +423,8 @@ derive_names() {
 		# Keep the name if there is nothing before the dot, e.g. '.hidden'.
 		[[ -n $base ]] && cmdname=$base
 	fi
+	[[ -n $cmdname && $cmdname != */* && $cmdname != . && $cmdname != .. ]] ||
+		die "invalid command name: $cmdname"
 
 	id=$(canonical_id "$cmdname")
 	: "${name:=${cmdname^}}"
@@ -275,12 +485,21 @@ install_icon() {
 
 # Write the .desktop file that puts the program in the launcher.
 write_desktop() {
-	local entry
+	local entry exec_target=$target
 	mkdir -p "$appdir"
 	entry=$appdir/$id.desktop
 
 	if [[ -e $entry ]] && ((!force)); then
 		die "$entry exists, -f to replace"
+	fi
+	# Quote special characters so paths with spaces remain one argument.
+	exec_target=${exec_target//%/%%}
+	if [[ $exec_target == *[^a-zA-Z0-9/_.,:+%-]* ]]; then
+		exec_target=${exec_target//\\/\\\\\\\\}
+		exec_target=${exec_target//\"/\\\\\"}
+		exec_target=${exec_target//\$/\\\\\$}
+		exec_target=${exec_target//\`/\\\\\`}
+		exec_target=\"$exec_target\"
 	fi
 
 	{
@@ -289,7 +508,7 @@ write_desktop() {
 		echo "Version=1.0"
 		echo "Name=$name"
 		[[ -n $comment ]] && echo "Comment=$comment"
-		echo "Exec=$target${argspec:+ $argspec}"
+		echo "Exec=$exec_target${argspec:+ $argspec}"
 		[[ -n $iconval ]] && echo "Icon=$iconval"
 		echo "Terminal=$terminal"
 		echo "Categories=$categories"
@@ -323,7 +542,7 @@ main() {
 	fi
 
 	resolve_target
-	derive_names
+	[[ -n $archive_stage ]] || derive_names
 
 	if ((symlink)); then
 		link_bin

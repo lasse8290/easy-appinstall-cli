@@ -174,11 +174,11 @@ if test_case "-e drops the remaining extension"; then
 fi
 
 if test_case "-e drops only the last extension"; then
-	tool=$sandbox/thing.tar.gz
+	tool=$sandbox/thing.bundle.sh
 	printf '#!/bin/sh\n' > "$tool"
 	run -e "$tool"
 	expect_status 0
-	expect_symlink_to "$bin/thing.tar" "$tool"
+	expect_symlink_to "$bin/thing.bundle" "$tool"
 	teardown
 fi
 
@@ -492,6 +492,272 @@ if test_case "stays quiet about PATH when bindir is on it"; then
 	out=$(PATH="$PATH:$bin" "$SUT" -c quietapp "$app" 2>&1); status=$?
 	expect_status 0
 	expect_no_out "is not on PATH"
+	teardown
+fi
+
+# Check actual archive contents, installed commands, and destination selection.
+for format in zip tar tar.gz tgz tar.bz2 tbz2 tar.xz txz; do
+	if test_case "archive: $format extracts and installs"; then
+		make_archive "$format"
+		run "$archive"
+		expect_status 0
+		expect_symlink_to "$bin/tool" "$HOME/Programs/Bundle/bundle/bin/tool"
+		expect_line "$HOME/Programs/Bundle/bundle/data.txt" "application data"
+		expect_line "$apps/tool.desktop" "Exec=$HOME/Programs/Bundle/bundle/bin/tool"
+		expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+		expect_file "$archive"
+		expect_eq "$(find "$HOME/Programs" -name '.app-install-*' -print)" ""
+		teardown
+	fi
+done
+
+if test_case "archive: explicit executable and destination with spaces"; then
+	make_archive zip ambiguous
+	run --install-dir "$sandbox/My Programs" --executable bundle/bin/tool -c chosen "$archive"
+	expect_status 0
+	expect_symlink_to "$bin/chosen" "$sandbox/My Programs/Bundle/bundle/bin/tool"
+	expect_line "$apps/chosen.desktop" "Exec=\"$sandbox/My Programs/Bundle/bundle/bin/tool\""
+	if desktop-file-validate "$apps/chosen.desktop"; then ok; else bad "invalid entry"; fi
+	teardown
+fi
+
+if test_case "archive: config supports quoted tilde and spaces"; then
+	make_archive tar.gz
+	mkdir -p "$HOME/.config/app-install"
+	printf '# Destination\n\n install_dir = "~/My Programs"' > "$HOME/.config/app-install/configfile"
+	run "$archive"
+	expect_status 0
+	expect_file "$HOME/My Programs/Bundle/bundle/data.txt"
+	teardown
+fi
+
+if test_case "archive: XDG config and argument precedence"; then
+	make_archive zip
+	export XDG_CONFIG_HOME=$sandbox/config
+	mkdir -p "$XDG_CONFIG_HOME/app-install"
+	printf 'install_dir=%s\n' "$sandbox/configured" > "$XDG_CONFIG_HOME/app-install/configfile"
+	run --no-desktop "$archive"
+	expect_status 0
+	expect_file "$sandbox/configured/Bundle/bundle/data.txt"
+	run -p "$sandbox/override" -c override "$archive"
+	expect_status 0
+	expect_file "$sandbox/override/Bundle/bundle/data.txt"
+	expect_no_file "$HOME/Programs/Bundle"
+	teardown
+fi
+
+if test_case "archive: config values are not executed"; then
+	make_archive zip
+	mkdir -p "$HOME/.config/app-install"
+	# Keep the command literal to test that config values cannot execute it.
+	# shellcheck disable=SC2016
+	printf 'install_dir=$(touch %s)\n' "$sandbox/executed" > "$HOME/.config/app-install/configfile"
+	out=$(cd "$sandbox" && "$SUT" "$archive" 2>&1); status=$?
+	expect_status 0
+	expect_no_file "$sandbox/executed"
+	teardown
+fi
+
+if test_case "archive: invalid config fails before extraction"; then
+	make_archive zip
+	mkdir -p "$HOME/.config/app-install"
+	printf 'unknown=value\n' > "$HOME/.config/app-install/configfile"
+	run "$archive"
+	expect_status 1
+	expect_out "invalid config"
+	expect_no_file "$HOME/Programs/Bundle"
+	teardown
+fi
+
+if test_case "archive: ambiguous executable leaves no installation"; then
+	make_archive tar ambiguous
+	run "$archive"
+	expect_status 1
+	expect_out "--executable"
+	expect_no_file "$HOME/Programs/Bundle"
+	expect_no_file "$bin/tool"
+	expect_eq "$(find "$HOME/Programs" -mindepth 1 -print)" ""
+	teardown
+fi
+
+if test_case "archive: explicit executable can lack execute permission"; then
+	make_archive zip noexec
+	run --executable bundle/bin/tool "$archive"
+	expect_status 0
+	expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+	teardown
+fi
+
+if test_case "archive: executable must be inside the bundle"; then
+	make_archive zip
+	for selected in ../MyTool.AppImage /bin/sh missing bundle; do
+		run --executable "$selected" "$archive"
+		expect_status 1
+		expect_no_file "$HOME/Programs/Bundle"
+	done
+	teardown
+fi
+
+if test_case "archive: replacement needs force and removes stale files"; then
+	make_archive tar
+	run "$archive"
+	expect_status 0
+	printf 'old\n' > "$HOME/Programs/Bundle/stale"
+	run "$archive"
+	expect_status 1
+	expect_out "-f to replace"
+	expect_file "$HOME/Programs/Bundle/stale"
+	run -f "$archive"
+	expect_status 0
+	expect_no_file "$HOME/Programs/Bundle/stale"
+	expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+	teardown
+fi
+
+if test_case "archive: corrupt replacement preserves existing files"; then
+	make_archive zip
+	run "$archive"
+	expect_status 0
+	printf 'broken' > "$archive"
+	run -f "$archive"
+	expect_status 1
+	expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+	expect_file "$apps/tool.desktop"
+	teardown
+fi
+
+if test_case "archive: failed directory move restores previous installation"; then
+	make_archive tar
+	run "$archive"
+	expect_status 0
+	printf 'keep\n' > "$HOME/Programs/Bundle/previous"
+	mkdir "$sandbox/mock"
+	cat > "$sandbox/mock/mv" <<'SH'
+#!/bin/sh
+case $3 in */files) exit 1 ;; esac
+exec /usr/bin/mv "$@"
+SH
+	chmod +x "$sandbox/mock/mv"
+	out=$(PATH="$sandbox/mock:$PATH" "$SUT" -f "$archive" 2>&1); status=$?
+	expect_status 1
+	expect_file "$HOME/Programs/Bundle/previous"
+	expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+	expect_eq "$(find "$HOME/Programs" -name '.app-install-*' -print)" ""
+	teardown
+fi
+
+if test_case "archive: launcher conflict leaves no extracted installation"; then
+	make_archive zip
+	run -c tool "$app"
+	expect_status 0
+	run "$archive"
+	expect_status 1
+	expect_no_file "$HOME/Programs/Bundle"
+	expect_symlink_to "$bin/tool" "$app"
+	teardown
+fi
+
+if test_case "archive: uninstall keeps extracted application files"; then
+	make_archive zip
+	run "$archive"
+	run -u tool
+	expect_status 0
+	expect_no_file "$bin/tool"
+	expect_no_file "$apps/tool.desktop"
+	expect_file "$HOME/Programs/Bundle/bundle/bin/tool"
+	teardown
+fi
+
+for format in zip tar; do
+	for variant in traversal absolute symlink_escape; do
+		if test_case "archive: $format rejects $variant"; then
+			make_archive "$format" "$variant"
+			run "$archive"
+			expect_status 1
+			expect_no_file "$HOME/Programs/Bundle"
+			expect_no_file "$sandbox/escaped"
+			expect_no_file "$HOME/escaped"
+			expect_no_file "$HOME/Programs/escaped"
+			teardown
+		fi
+	done
+done
+
+if test_case "archive: tar allows internal symlinks"; then
+	make_archive tar symlink_inside
+	run --executable bundle/run "$archive"
+	expect_status 0
+	expect_symlink_to "$bin/run" "$HOME/Programs/Bundle/bundle/bin/tool"
+	expect_eq "$("$bin/run" 2>/dev/null)" "archive-ok"
+	teardown
+fi
+
+if test_case "archive: tar rejects special files"; then
+	make_archive tar fifo
+	run "$archive"
+	expect_status 1
+	expect_no_file "$HOME/Programs/Bundle"
+	teardown
+fi
+
+for variant in ambiguous_link parent_link; do
+	if test_case "archive: tar rejects $variant"; then
+		make_archive tar "$variant"
+		run "$archive"
+		expect_status 1
+		expect_no_file "$HOME/Programs/Bundle"
+		expect_no_file "$sandbox/escaped"
+		teardown
+	fi
+done
+
+if test_case "archive: installer does not invoke Python"; then
+	mkdir "$sandbox/mock"
+	cat > "$sandbox/mock/python3" <<'SH'
+#!/bin/sh
+touch "$HOME/python-was-called"
+exit 1
+SH
+	chmod +x "$sandbox/mock/python3"
+	ln -s python3 "$sandbox/mock/python"
+	for format in zip tar.gz; do
+		make_archive "$format"
+		out=$(PATH="$sandbox/mock:$PATH" "$SUT" -f "$archive" 2>&1); status=$?
+		expect_status 0
+		expect_eq "$("$bin/tool" 2>/dev/null)" "archive-ok"
+		expect_no_file "$HOME/python-was-called"
+	done
+	teardown
+fi
+
+if test_case "archive: destination symlink is refused even with force"; then
+	make_archive zip
+	mkdir -p "$HOME/Programs" "$sandbox/keep"
+	ln -s "$sandbox/keep" "$HOME/Programs/Bundle"
+	run -f "$archive"
+	expect_status 1
+	expect_out "destination is a symlink"
+	expect_symlink_to "$HOME/Programs/Bundle" "$sandbox/keep"
+	teardown
+fi
+
+if test_case "archive: strip extension applies once"; then
+	make_archive zip
+	run -e -c tool.bundle.sh "$archive"
+	expect_status 0
+	expect_file "$bin/tool.bundle"
+	teardown
+fi
+
+if test_case "archive: options need values and an archive target"; then
+	for option in -p --install-dir --executable; do
+		run "$option"
+		expect_status 1
+		expect_out "needs"
+	done
+	run --executable tool "$app"
+	expect_status 1
+	expect_out "archive options need an archive"
 	teardown
 fi
 

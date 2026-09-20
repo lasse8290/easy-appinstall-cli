@@ -43,7 +43,7 @@ setup() {
 	sandbox=$(mktemp -d) || exit 1
 	export HOME=$sandbox/home
 	mkdir -p "$HOME"
-	unset XDG_DATA_HOME ZDOTDIR
+	unset XDG_DATA_HOME XDG_CONFIG_HOME ZDOTDIR
 	bin=$HOME/.local/bin
 	apps=$HOME/.local/share/applications
 	icons=$HOME/.local/share/icons/hicolor
@@ -61,21 +61,7 @@ teardown() { [[ -n ${sandbox-} && $sandbox == /tmp/* ]] && rm -rf "$sandbox"; }
 # Embedded so CI needs no image tooling, and so `file` reports a real size for
 # the icon-bucket logic. 64x64 red, and 100x40 green. Minimal uncompressed-ish
 # RGB PNGs, hand-built rather than pulled in as binary fixtures.
-# Regenerate with, and diff against, this:
-#
-#   python3 -c "
-#   import zlib,struct,base64
-#   def chunk(t,d):
-#       c=t+d; return struct.pack('>I',len(d))+c+struct.pack('>I',zlib.crc32(c))
-#   def png(w,h,rgb):
-#       raw=b''.join(b'\x00'+bytes(rgb)*w for _ in range(h))
-#       return (b'\x89PNG\r\n\x1a\n'
-#               + chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))
-#               + chunk(b'IDAT',zlib.compress(raw,9))
-#               + chunk(b'IEND',b''))
-#   print('_PNG_SQUARE='+base64.b64encode(png(64,64,(255,0,0))).decode())
-#   print('_PNG_WIDE='+base64.b64encode(png(100,40,(0,255,0))).decode())
-#   "
+# Generate these values with: python3 tests/make_pngs.py
 #
 # Colour bit depth 8, colour type 2 (truecolour), no interlace; each scanline
 # is prefixed with filter byte 0. zlib level 9 matters, the base64 below only
@@ -89,6 +75,12 @@ make_png_square() { printf '%s' "$_PNG_SQUARE" | base64 -d > "$1"; }
 make_png_wide()   { printf '%s' "$_PNG_WIDE" | base64 -d > "$1"; }
 # Scalable icon.
 make_svg() { printf '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"/>\n' > "$1"; }
+
+# Build real archives with a program and a data file.
+make_archive() {
+	archive=$sandbox/Bundle.$1
+	python3 "$_harness_dir/make_archive.py" "$archive" "$1" "${2:-normal}"
+}
 
 # ---------------------------------------------------------------- running
 
